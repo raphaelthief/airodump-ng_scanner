@@ -168,7 +168,7 @@ def check_and_install_tools(tools):
 ######################### Bash programs #########################
 #################################################################
 
-def airodump(script_path, channel, interface, save_airodump):
+def airodump(script_path, channel, interface, save_airodump, airmon):
     save_airodump2 = ""
     
     if save_airodump == "yes":
@@ -176,11 +176,20 @@ def airodump(script_path, channel, interface, save_airodump):
     else:
         save_airodump2 = " --output-format csv,cap"
         
-        
+    bash_script = ""
+    
     # Step 1 : create bash file
     bash_script = f"""#!/bin/bash
     airodump-ng {interface} --write /tmp/output{save_airodump2} --write-interval 3 --background 1 {channel}
     """
+    
+    if airmon == "yes": # add airmon-ng check kill to script
+        bash_script = f"""#!/bin/bash
+        airmon-ng check kill
+        airodump-ng {interface} --write /tmp/output{save_airodump2} --write-interval 3 --background 1 {channel}
+        """    
+    
+    
     print(f"{Fore.YELLOW}[!] {Style.RESET_ALL}Launching the following script :")
     print(f"{Fore.GREEN}------------------------------------------------------------------------{Style.RESET_ALL}")
     print(bash_script)
@@ -562,6 +571,7 @@ used_colors = [] # Store a list of colors that have already been assigned
 tsharked = "" # Check tshark installation for WPS checkin
 cycle_counter = 0 # Refresh wps every 3 read_and_display_csv cycle
 mapped = "no"
+airmon = "no"
 
 def read_and_display_csv(file_path, interface, channel, mapped, file_path_cap, tsharked, save_airodump):
     """Display CSV data from airodump-ng with unique colors for each matched BSSID."""
@@ -756,6 +766,21 @@ def read_and_display_csv(file_path, interface, channel, mapped, file_path_cap, t
                 print(e)
                 log_debug(f"{e}", include_traceback=False)
 
+            try:
+                if airmon == "yes":
+                    print(f"{Fore.CYAN}[INFO] {Style.RESET_ALL}Restarting NetworkManager")
+                    result = subprocess.run(
+                        ["sudo", "NetworkManager", "restart"],
+                        check=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True  # Decode output char
+                    )
+            except Exception as e:
+                print(f"{Fore.RED}[!] Couldn't restart NetworkManager :")                
+                print(e)
+                log_debug(f"{e}", include_traceback=False)
+
         check_and_delete_output_file(file_path_csv, file_path_cap, script_path, save_airodump)
         sys.exit(0)          
     except Exception as e:
@@ -807,7 +832,7 @@ def main():
                 check=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True  # Pour décoder la sortie en chaîne de caractères
+                text=True  # Decode output char
             )
         except subprocess.CalledProcessError as e:
             log_debug(f"Error :\n- {e}\n- {e.stdout}", include_traceback=False)
@@ -830,7 +855,7 @@ def main():
             log_debug("[INFO] --help command display", include_traceback=False)
             sys.exit(0)        
 
-
+        airmoncheck = input(f"{Fore.GREEN}[+] {Style.RESET_ALL}Check kill (airmon-ng) ? NetworkManager will restart at the end (y/n) : ").strip()
         mapping = input(f"{Fore.GREEN}[+] {Style.RESET_ALL}Setup wireless mapping at the end of the scan (airdecap-ng & airgraph-ng) (y/n) : ").strip()
         
         if mapping.lower() in ['y', 'yes']:
@@ -852,8 +877,17 @@ def main():
         else:
             save_airodump = "no"
 
+        if airmoncheck.lower() in ['y', 'yes']:
+            airmon = "yes"
+        elif airmoncheck.lower() in ['n', 'no']:
+            airmon = "no"
+        else:
+            print(f"{Fore.YELLOW}[!] {Style.RESET_ALL}Default value set : 'no'")
+            log_debug("[INFO] airmon error input. Default setting set to 'no'", include_traceback=False)
+            airmon = "no"
 
-        airodump(script_path, channel, interface, save_airodump)
+
+        airodump(script_path, channel, interface, save_airodump, airmon)
 
 
         try:
@@ -885,7 +919,22 @@ def main():
                     print(f"{Fore.RED}[!] airgraph.sh couldn't be launched :")                
                     print(e)
                     log_debug(f"{e}", include_traceback=False)
-                        
+
+                try:
+                    if airmon == "yes":
+                        print(f"{Fore.CYAN}[INFO] {Style.RESET_ALL}Restarting NetworkManager")
+                        result = subprocess.run(
+                            ["sudo", "NetworkManager", "restart"],
+                            check=True,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True  # Decode output char
+                        )
+                except Exception as e:
+                    print(f"{Fore.RED}[!] Couldn't restart NetworkManager :")                
+                    print(e)
+                    log_debug(f"{e}", include_traceback=False)
+            
                 check_and_delete_output_file(file_path_csv, file_path_cap, script_path, save_airodump)
                 sys.exit(0)         
             
@@ -899,11 +948,27 @@ def main():
             if mapped.lower() in ['y', 'yes']:
                 print(f"{Fore.GREEN}[+] {Style.RESET_ALL}Launching airgraph.sh ...")
                 airgraph()
+
         except Exception as e:
             print(f"{Fore.RED}[!] airgraph.sh couldn't be launched :")                
             print(e)
             log_debug(f"{e}", include_traceback=False)
-                
+
+        try:
+            if airmon == "yes":
+                print(f"{Fore.CYAN}[INFO] {Style.RESET_ALL}Restarting NetworkManager")
+                result = subprocess.run(
+                    ["sudo", "NetworkManager", "restart"],
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True  # Decode output char
+                )
+        except Exception as e:
+            print(f"{Fore.RED}[!] Couldn't restart NetworkManager :")                
+            print(e)
+            log_debug(f"{e}", include_traceback=False)
+
         check_and_delete_output_file(file_path_csv, file_path_cap, script_path, save_airodump)
         sys.exit(0)        
         
