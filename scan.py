@@ -1,17 +1,48 @@
-import csv, time, os, sys, subprocess, requests, traceback, gc
+import csv, time, os, sys, subprocess, requests, traceback, gc, re, termios, tty, select, shlex
 from datetime import datetime
 from itertools import cycle
 from subprocess import Popen, PIPE
+from collections import deque, defaultdict
+from scapy.all import *
+#from binascii import hexlify
+from pathlib import Path
+
 from colorama import init, Fore, Style
 init() # Init colorama
 
+#################################################################
+#########################   VAriables  ##########################
+#################################################################
+
+DEBUG_FILE_PATH = "debug.txt" # If there are some errors, it will appears here
+Karma_list = set()
+karma = "no"
+
+log_buffer = deque(maxlen=40) # Attack logs output 40 lines max
+process_attack = None
+
+sta_mac = "02:00:00:9E:1C:69"   # Fake mac station (blacklist output)
+
+attackmode = "no"
+
+ap_channels = {}
+bssid_color_map = {} # Store the list of colors assigned to the BSSIDs
+used_colors = [] # Store a list of colors that have already been assigned
+tsharked = "" # Check tshark installation for WPS checkin
+last_wps_check    = time.monotonic() # Refresh wps every X read_and_display_csv cycle
+
+mapped = "no"
+airmon = "no"
+TXpower = "no"
+
+errors_detected = False
+
+oldchannel = ""
 
 
 #################################################################
 #######################   Errors & debug  #######################
 #################################################################
-
-DEBUG_FILE_PATH = "debug.txt" # If there are some errors, it will appears here
 
 def init_debug_file():
     """Init debug with date of today"""
@@ -35,7 +66,7 @@ def log_debug(message, include_traceback=False):
     except:
         pass
         
-        
+
 #################################################################
 #########################   Check & co  #########################
 #################################################################
@@ -44,7 +75,6 @@ def clear_console():
     """Clear the screen for continuous updates"""
     os.system('clear')
     
-
 def check_and_delete_output_file(file_path_csv, file_path_cap, script_path, save_airodump):
     """cache files check and clean"""
     try:
@@ -137,8 +167,6 @@ def check_and_delete_output_file(file_path_csv, file_path_cap, script_path, save
         print(f"{Fore.RED}[!] Couldn't delete '/tmp/output-01.log.csv' (--get option feature trigger) : {e}")
         log_debug(f"Couldn't delete '/tmp/output-01.log.csv' (--get option feature trigger)", include_traceback=False)
 
-
-
 def check_and_install_tools(tools):
     """
     Vérifie si les outils nécessaires sont installés, et les installe s'ils ne le sont pas.
@@ -168,27 +196,28 @@ def check_and_install_tools(tools):
 ######################### Bash programs #########################
 #################################################################
 
-def airodump(script_path, channel, interface, save_airodump, airmon):
+def airodump(script_path, channel, interface, save_airodump, airmon, attackmode):
     save_airodump2 = ""
     
     if save_airodump == "yes":
         save_airodump2 = ""
     else:
         save_airodump2 = " --output-format csv,cap"
-        
-    bash_script = ""
-    
+
+    if attackmode == "yes":
+        if "-f" not in channel:
+            channel = channel + " -f 60000"
+
     # Step 1 : create bash file
     bash_script = f"""#!/bin/bash
-    airodump-ng {interface} --write /tmp/output{save_airodump2} --write-interval 3 --background 1 {channel}
+    airodump-ng {interface} --write /tmp/output{save_airodump2} --write-interval 2 --background 1 {channel}
     """
     
     if airmon == "yes": # add airmon-ng check kill to script
         bash_script = f"""#!/bin/bash
         airmon-ng check kill
-        airodump-ng {interface} --write /tmp/output{save_airodump2} --write-interval 3 --background 1 {channel}
+        airodump-ng {interface} --write /tmp/output{save_airodump2} --write-interval 2 --background 1 {channel}
         """    
-    
     
     print(f"{Fore.YELLOW}[!] {Style.RESET_ALL}Launching the following script :")
     print(f"{Fore.GREEN}------------------------------------------------------------------------{Style.RESET_ALL}")
@@ -204,6 +233,7 @@ def airodump(script_path, channel, interface, save_airodump, airmon):
         process = subprocess.Popen([script_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except Exception as e:
         log_debug(f"{e}", include_traceback=True)
+
 
 def airgraph():
     base_directory = os.getcwd()
@@ -274,19 +304,49 @@ def help_airodump():
 
       --help                : Displays this usage screen
   {Fore.GREEN}------------------------------------------------------------------------{Style.RESET_ALL}
+
   Extra settings (script settings):
-      --get  : Get all airodump-ng outputs without deleting them by closing the script (located in /tmp directory)
-  
+      --get    : Get all airodump-ng outputs without deleting them by closing the script (located in /tmp directory)
+      --attack : Launch deauth attacks with formed packets with scapy (airodump-ng args '-f' set to 60000)
+                - PMKID attacks
+                    - Assoc PMKID
+                    - Assoc FT PMKID
+                    - Probe PMKID
+                - Deauth attacks
+                    - AP to Clients (code 7)
+                    - Client to AP (code 7)
+                    -  Deauth AP broadcast (code 7)
+                --> Extra commands with --attack mod :
+                    --scan-rounds : Number of scan cycles to perform (default: 3 rounds)
+                    --dwell-time  : Time (in seconds) to stay on each channel (default: 3s)
+                    --cswitch     : Canal switch methods (0: FIFO, 1: Round Robin, 2: Hop on last). FIFO by default
+                    - If no channel (-c or --channel) is provided, the attack will run on channels 1, 6, 11 by default
+      --karma  : Collect all probe ESSID from clients and show them all when closing    
   {Fore.GREEN}------------------------------------------------------------------------{Style.RESET_ALL}
+  
   Internal functionnement:
-      airodump-ng <selected interface> --write /tmp/output --output-format csv,cap --write-interval 3 --background 1 <your commands inputs>
+      airodump-ng <selected interface> --write /tmp/output --output-format csv,cap --write-interval 2 --background 1 <your commands inputs>
       manufacturer comes from oui file
       wps infos comes from the extract .cap file made by airodump-ng
-      Last seen AP and Clients before timeout : 120s (4min)
+      Last seen AP and Clients before timeout : 60s
 
   Aigraph functionnement (wireless mapping):
       airgraph-ng -o CAPR_png -i /tmp/output-01.csv -g CAPR
       airgraph-ng -o CPG_png -i /tmp/output-01.csv -g CPG
+
+  Karma functionnement:
+      Just rewrite all probed ESSID from Clients
+
+  Attack functionnement:
+      Use Scapy lib to perform PMKID & Deauth attacks
+      All deauth are set to reason code 7
+      Various PMKID attacks supported
+      Attack only 1 time each targets (AP & clients)
+      PMKID probes set to null bytes (0x00 * 16)
+      Deatuh packets send for each targets : x5
+      PMKID packets send for each targets  : x3
+
+  Press [SPACE] to pause & resume the output. Airodump-ng will still cap in background    
 '''    
     print(infos)
 
@@ -434,7 +494,6 @@ def check_wps_update():
         pass
 
 
-
 #################################################################
 ######################### Format stuffs #########################
 #################################################################
@@ -492,7 +551,7 @@ def get_color_palette():
             '\033[38;5;213m', # Color_213: Bright Pink
             '\033[38;5;101m', # Color_101: Rosy Red
             '\033[38;5;226m', # Color_226: Bright Yellow
-        ]
+        ] # Feel free to add more colors here
         
         # Reinitialise colors if already all used
         if len(used_colors) >= len(colors):
@@ -540,6 +599,34 @@ def get_manufacturer(mac, manufacturer_map):
 
 
 #################################################################
+########################### TX Power ############################
+#################################################################
+
+def set_txpower(interface: str, dbm: int) -> bool:
+    """Set TX Power (dBm → centi-dBm). Return True if success"""
+    try:
+        value = str(dbm * 100)  # Ex: 30 dBm → "3000"
+        subprocess.run(
+            ["sudo", "iw", "dev", interface, "set", "txpower", "fixed", value],
+            check=True, capture_output=True
+        )
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"{Fore.RED}[!] Couldn't set TX Power : " + (e.stderr or e.stdout).decode() if isinstance(e.stderr, bytes) else e.stderr)
+        log_debug("[INFO] Couldn't set TX Power : " + (e.stderr or e.stdout).decode() if isinstance(e.stderr, bytes) else e.stderr, include_traceback=False)
+        return False
+
+def get_txpower(interface: str) -> float:
+    """Actual TX Power (dBm)."""
+    try:
+        result = subprocess.check_output(["iw", "dev", interface, "info"], text=True)
+        match = re.search(r"txpower\s+([\d.]+)\s+dBm", result)
+        return float(match.group(1)) if match else -1.0
+    except subprocess.CalledProcessError:
+        return -1.0
+
+
+#################################################################
 ############################ --save #############################
 #################################################################
 
@@ -566,225 +653,517 @@ def save_to_csv(file_name, headers, data):
 ######################### Display infos #########################
 #################################################################
 
-bssid_color_map = {} # Store the list of colors assigned to the BSSIDs
-used_colors = [] # Store a list of colors that have already been assigned
-tsharked = "" # Check tshark installation for WPS checkin
-cycle_counter = 0 # Refresh wps every 3 read_and_display_csv cycle
-mapped = "no"
-airmon = "no"
+def stream_output(process):
+    for line in iter(process.stdout.readline, b''):
+        decoded = line.decode(errors="replace").rstrip()
+        log_buffer.append(decoded)
 
-def read_and_display_csv(file_path, interface, channel, mapped, file_path_cap, tsharked, save_airodump):
-    """Display CSV data from airodump-ng with unique colors for each matched BSSID."""
-    global cycle_counter
-    
-    try:
-        tsharkinfos = " |"
-        mappedinfos = "Network mapping disabled"
-        
-        try:
-            manufacturer_map = load_manufacturer_data("oui.txt") # Manufacturer datas from https://standards-oui.ieee.org/oui/oui.txt
-        except:
-            pass
-            
-        if tsharked == "no":
-            tsharkinfos = " | tshark not installed - no WPS infos displayed |"
-        
-        if mapped == "yes":
-            mappedinfos = "Network mapping enabled at the end of the scan"
+
+def analyse_handshakes(cap_file: str) -> dict[str, dict]:
+    """
+    Check .cap and for each BSSID :
+      {
+        "pmkid"         : True/False,
+        "eapol_counts"  : {1: n1, 2: n2, 3: n3, 4: n4},
+        "eapol_total"   : somme des n,
+        "eapol_complete": True/False (at least 1x M1,M2,M3,M4),
+        "crackable"     : pmkid or eapol_complete
+      }
+    """
+
+    # --- A) PMKID ----------------------------------------------------------
+    cmd_pmkid = (
+        f"tshark -r '{cap_file}' "
+        "-Y 'wlan.rsn.ie.pmkid and wlan.rsn.ie.pmkid != 00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00' "
+        "-T fields -e wlan.bssid | sort -u"
+    )
+    pmkid_out = subprocess.run(
+        cmd_pmkid, shell=True,
+        capture_output=True, text=True
+    ).stdout
+
+    # --- B) EAPOL : msgnr ------------------------------------
+    cmd_eapol = (
+        f"tshark -r '{cap_file}' -Y eapol "
+        "-T fields -e wlan.bssid -e wlan_rsna_eapol.keydes.msgnr"
+    )
+    run_eapol = subprocess.run(
+        cmd_eapol, shell=True,
+        capture_output=True, text=True
+    )
+    eapol_out = run_eapol.stdout
+
+    info: dict[str, dict] = defaultdict(lambda: {
+        "pmkid": False,
+        "eapol_counts": defaultdict(int)
+    })
+
+    # -- PMKID
+    for bssid in pmkid_out.splitlines():
+        bssid = bssid.strip().lower()
+        if bssid:
+            info[bssid]["pmkid"] = True
+
+    # -- Count M1‑M4 if msgnr aviable
+    if eapol_out:
+        for line in eapol_out.splitlines():
+            try:
+                bssid, msg = line.split('\t')
+                m = int(msg)
+                if 1 <= m <= 4:
+                    info[bssid.lower()]["eapol_counts"][m] += 1
+            except ValueError:
+                continue
+    else:
+        # --- Fallback : key_info --------------------------
+        cmd_eapol = (
+            f"tshark -r '{cap_file}' -Y eapol "
+            "-T fields -e wlan.bssid -e wlan_rsna_eapol.keydes.key_info"
+        )
+        eapol_out = subprocess.run(
+            cmd_eapol, shell=True,
+            capture_output=True, text=True
+        ).stdout
+
+        def msg_from_keyinfo(ki: int) -> int | None:
+            # Bits (little‑endian) : 0x40 Install / 0x80 ACK / 0x100 MIC
+            install = bool(ki & 0x0040)
+            ack     = bool(ki & 0x0080)
+            mic     = bool(ki & 0x0100)
+            if  ack and not mic and not install: return 1   # M1
+            if not ack and     mic and not install: return 2   # M2
+            if  ack and     mic and     install: return 3   # M3
+            if not ack and     mic and not install: return 4   # M4 (Secure bit)
+            return None
+
+        for line in eapol_out.splitlines():
+            try:
+                bssid, ki = line.split('\t')
+                m = msg_from_keyinfo(int(ki, 0))
+                if m:
+                    info[bssid.lower()]["eapol_counts"][m] += 1
+            except ValueError:
+                continue
+
+    for bssid, d in info.items():
+        counts = d["eapol_counts"]
+        has_M1M2 = counts.get(1, 0) > 0 and counts.get(2, 0) > 0
+        has_M2M3 = counts.get(2, 0) > 0 and counts.get(3, 0) > 0
+
+        d["eapol_minimal"] = has_M1M2 or has_M2M3
+        if has_M1M2:
+            d["eapol_pair"] = "M1+M2"
+        elif has_M2M3:
+            d["eapol_pair"] = "M2+M3"
         else:
-            mappedinfos = "Network mapping disabled"
-        
-        bandz = "2.4GHz band" if channel == "" else f"command {channel}"
-        
-        try:
-            with open(file_path, mode='r', newline='', encoding='utf-8') as csvfile:
-                reader = csv.reader(csvfile)
-                data = list(reader)
+            d["eapol_pair"] = None
 
-                # Separate the sections of the APs and the clients
-                ap_data = []
-                station_data = []
+    # -- Final output
+    for d in info.values():
+        counts = d["eapol_counts"]
+        d["eapol_total"]    = sum(counts.values())
+        d["eapol_complete"] = all(counts.get(m, 0) > 0 for m in (1, 2, 3, 4))
+        #d["crackable"]      = d["pmkid"] or d["eapol_complete"]
+        d["crackable"]      = d["pmkid"] or d.get("eapol_minimal", False)
 
-                is_station_section = False
-                for row in data:
-                    if row and row[0].startswith('Station MAC'):
-                        is_station_section = True
-                        continue  # Ignore the header of the clients
-                    
-                    if not is_station_section:
-                        ap_data.append(row)
-                    else:
-                        station_data.append(row)
+    return info
 
-                # Extract the BSSIDs from the APs and the clients
-                ap_bssids = {row[0].strip() for row in ap_data if len(row) > 0 and row[0].strip()}
-                client_bssids = {row[5].strip() for row in station_data if len(row) > 0 and row[5].strip()}
-
-
-                # Clear unused used_colors and bssid_color_map
-                for bssid, color in list(bssid_color_map.items()):
-                    if bssid not in ap_bssids and bssid not in client_bssids:
-                        used_colors.remove(color)  
-                        del bssid_color_map[bssid]  # Clear inactives BSSID colors attribued
-
-
-                # Create a color palette for the matches
-                color_palette = get_color_palette()
-
-                # Assign a unique color to the BSSIDs that appear in both the APs and the clients
-                for bssid in ap_bssids & client_bssids:
-                    if bssid not in bssid_color_map:  # Assign a color if it has not been assigned
-                        try:
-                            color = next(color_palette)
-                        except StopIteration:  # Restart iteration if all colors where used
-                            color_palette = get_color_palette()
-                            color = next(color_palette)
-
-                        bssid_color_map[bssid] = color
-                        used_colors.append(color)  # Set used colors
-
-                # Show data after clearing the console
-                clear_console()
-
-                # AP's
-                print(f"{Fore.YELLOW}[!] Listening on {interface} on {bandz}{tsharkinfos} {mappedinfos}\n")
-                print(f"{Fore.CYAN}==== Access Point (AP) ===={Style.RESET_ALL}")
-                print(f"{'BSSID':<20}{'Channel':<10}{'# Beacons':<15}{'Privacy':<15}{'Cipher':<15}{'Authentication':<17}{'Power':<10}{'WPS':<20}{'ESSID':<20}{'Manufacturer'}")
-                print('-' * 155)
-         
-                for row in ap_data:
-                    if len(row) > 1 and row[2].strip() != "Last time seen":
-                        try:
-                            format_str = "%Y-%m-%d %H:%M:%S"  # format
-                            date_obj = datetime.strptime(row[2].strip(), format_str)
-                            current_time = datetime.now()
-                            time_difference = current_time - date_obj
-                            if time_difference.total_seconds() > 240:  # timeout 4min --> realtime live clients
-                                continue
-                            else:
-                            
-                                power_color = get_signal_color(row[8])  # Color based on the signal strength
-                                bssid = row[0].strip()
-                                
-                                manufacturer = get_manufacturer(bssid, manufacturer_map)                            
-                                bssid_color = bssid_color_map.get(bssid, "")  # Get unique color if matched
-                                
-                                security = row[5].strip()
-                                if security in ['OPN', 'WEP']:
-                                    security_color = Fore.GREEN
-                                else:
-                                    security_color = bssid_color
-
-                                MGT = row[7].strip()
-                                if MGT == "MGT":
-                                    MGT_color = Fore.RED
-                                else:
-                                    MGT_color = bssid_color
-
-                                if tsharked == "no":
-                                    wps_status = "/"
-                                else:
-                                    try:
-                                        wps_status = check_wps(bssid)
-                                        if wps_status is None or wps_status.strip() == "": # Security check (:<value can't be a None value)
-                                            wps_status = "/"  # Default string value
-                                    except Exception as e:
-                                        wps_status = "/"
-                                    
-                                    if wps_status == "[Locked]":
-                                        wps_color = Fore.RED
-                                    else:
-                                        wps_color = bssid_color
-                                    
-                                print(f"{bssid_color}{bssid:<20}{row[3]:<10}{row[9]:<15}{security_color}{row[5]:<15}{bssid_color}{row[6]:<15}{MGT_color}{row[7]:<17}{power_color}{row[8]:<10}{Style.RESET_ALL}{wps_color}{format_text(wps_status, 20)}{Style.RESET_ALL}{bssid_color}{format_text(row[13], 20)}{manufacturer}{Style.RESET_ALL}")
-                        except Exception as e:
-                            log_debug(f"{e}", include_traceback=True)
-                            continue
-
-                # Clients
-                print(f"\n{Fore.CYAN}==== Clients (Stations) ===={Style.RESET_ALL}")
-                print(f"{'Station MAC':<20}{'Manufacturer':<30}{'Power':<10}{'# Packets':<15}{'BSSID':<20}{'Probed ESSIDs'}")
-                print('-' * 109)
-                for row in station_data:
-                    if len(row) > 1 and row[2].strip() != "Last time seen":
-                        try:
-                            format_str = "%Y-%m-%d %H:%M:%S"  # format
-                            date_obj = datetime.strptime(row[2].strip(), format_str)
-                            current_time = datetime.now()
-                            time_difference = current_time - date_obj
-                            if time_difference.total_seconds() > 240:  # timeout 4min --> realtime live clients
-                                continue
-                            else:
-                            
-                                station_mac = row[0].strip()
-                                manufacturer = get_manufacturer(station_mac, manufacturer_map)
-                                
-                                power_color = get_signal_color(row[3])  # Color based on the signal strength
-                                
-                                bssid = row[5].strip()  # Client associated BSSID
-                                bssid_color = bssid_color_map.get(bssid, "")  # Get unique color if matched
-                                
-                                print(f"{bssid_color}{row[0]:<20}{format_text(manufacturer, 30)}{power_color}{row[3]:<10}{Style.RESET_ALL}{bssid_color}{row[4]:<15}{bssid:<20}{row[6]}{Style.RESET_ALL}")
-                        except Exception as e:
-                            log_debug(f"{e}", include_traceback=True)
-                            continue
-
-                
-
-                if cycle_counter >= 3:
-                    cycle_counter = 0  # Reset cycle to 0
-                    
-                    if tsharked == "no":
-                        pass
-                    else:                     
-                        check_wps_update()
-                        
-                # Free memory to avoid crash
-                ap_data.clear()
-                station_data.clear()
-                del ap_data, station_data
-            
-        except IOError as e:
-            log_debug(f"{file_path} in use by airodump-ng :\n{e}", include_traceback=False)
-
-    except FileNotFoundError:
-        print(f"File {file_path} doesn't exist. Closing ...")
-        log_debug(f"File {file_path} doesn't exist. Closing ...", include_traceback=False)
-        sys.exit(0)
-    except KeyboardInterrupt:
-        script_path = '/tmp/airodumpscript.sh'
-        file_path_csv = '/tmp/output-01.csv'
-        file_path_cap = '/tmp/output-01.cap'
-        print(f"\n{Fore.RED}[!] KeyboardInterrupt")
-        print(save_airodump)
-        if mapped.lower() in ['y', 'yes']:
-            try:
-                print(f"{Fore.GREEN}[+] {Style.RESET_ALL}Launching airgraph.sh ...")
-                airgraph()
-            except Exception as e:
-                print(f"{Fore.RED}[!] airgraph.sh couldn't be launched :")                
-                print(e)
-                log_debug(f"{e}", include_traceback=False)
-
-            try:
-                if airmon == "yes":
-                    print(f"{Fore.CYAN}[INFO] {Style.RESET_ALL}Restarting NetworkManager")
-                    result = subprocess.run(
-                        ["sudo", "NetworkManager", "restart"],
-                        check=True,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        text=True  # Decode output char
-                    )
-            except Exception as e:
-                print(f"{Fore.RED}[!] Couldn't restart NetworkManager :")                
-                print(e)
-                log_debug(f"{e}", include_traceback=False)
-
-        check_and_delete_output_file(file_path_csv, file_path_cap, script_path, save_airodump)
-        sys.exit(0)          
+def get_current_channel(interface):
+    try:
+        output = subprocess.check_output(["iw", "dev", interface, "info"]).decode()
+        match = re.search(r"channel\s+(\d+)", output)
+        if match:
+            return int(match.group(1))
     except Exception as e:
-        pass
+        log_debug(f"[INFO] Channel display error : {e}", include_traceback=True)
+    return "Unknow"
+
+def read_and_display_csv(file_path, interface, channel, mapped, TXpower, file_path_cap, tsharked, save_airodump, timeout_sec):
+    """Display CSV data from airodump-ng with unique colors for each matched BSSID."""
+    global last_wps_check, errors_detected, oldchannel, karma, process_attack,attackmode
+    
+    # Pause & Resume stuff 
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    tty.setcbreak(fd)
+    paused = False
+
+    while True:
+        # Pause & Resume stuff 
+        r, _, _ = select.select([sys.stdin], [], [], 0)
+        if r:
+            ch = sys.stdin.read(1)
+            if ch == ' ':
+                paused = not paused
+                print(f"\n{Fore.CYAN}[PAUSED]" if paused else f"{Fore.CYAN}[RESUME]")
+
+        # Get current channel listening
+        current_channel = get_current_channel(interface)
+
+        if not paused:
+            #time.sleep(3)  # Refresh every 3s
+            try:
+                tsharkinfos = " |"
+                mappedinfos = "Network mapping disabled"
+                TXpowerinfos = "(20-22db)"
+
+                handshake_info = analyse_handshakes('/tmp/output-01.cap')
+                #already_cracked = {b for b, d in handshake_info.items() if d.get("crackable")}
+
+                nb_crackable   = sum(1 for v in handshake_info.values() if v["crackable"])
+                nb_pmkid       = sum(1 for v in handshake_info.values() if v["pmkid"])
+                nb_4way        = sum(1 for v in handshake_info.values() if v["eapol_complete"])
+                nb_minimal     = sum(1 for v in handshake_info.values() if v.get("eapol_minimal", False))
+
+                try:
+                    manufacturer_map = load_manufacturer_data("oui.txt") # Manufacturer datas from https://standards-oui.ieee.org/oui/oui.txt
+                except:
+                    pass
+                    
+                if tsharked == "no":
+                    tsharkinfos = " | tshark not installed - no WPS infos displayed |"
+                
+                if mapped == "yes":
+                    mappedinfos = "Network mapping enabled at the end of the scan"
+                else:
+                    mappedinfos = "Network mapping disabled"
+                
+                bandz = "2.4GHz band" if channel == "" else f"command {channel}"
+                
+                if TXpower == "yes":
+                    TXpowerinfos = "(30db)"
+
+                if karma == "yes":
+                    karmatrigger = f"| {Fore.RED}[!] Karma sniffing"
+                else:
+                    karmatrigger = ""
+
+                if attackmode == "yes":
+                    attacktrigger = f"| {Fore.RED}[!] Attack mode enabled"
+                else:
+                    attacktrigger = ""
+
+                try:
+                    with open(file_path, mode='r', newline='', encoding='iso-8859-1') as csvfile:
+                        reader = csv.reader(csvfile)
+                        data = list(reader)
+
+                        # Separate the sections of the APs and the clients
+                        ap_data = []
+                        station_data = []
+
+                        is_station_section = False
+                        for row in data:
+                            if row and row[0].startswith('Station MAC'):
+                                is_station_section = True
+                                continue  # Ignore the header of the clients
+                            
+                            if not is_station_section:
+                                ap_data.append(row)
+                            else:
+                                station_data.append(row)
+
+                        # Extract the BSSIDs from the APs and the clients
+                        ap_bssids = {row[0].strip() for row in ap_data if len(row) > 0 and row[0].strip()}
+                        #client_bssids = {row[5].strip() for row in station_data if len(row) > 0 and row[5].strip()}
+                        client_bssids = {row[5].strip() for row in station_data if len(row) > 5 and row[5].strip()}
+
+                        # Clear unused used_colors and bssid_color_map
+                        for bssid, color in list(bssid_color_map.items()):
+                            if bssid not in ap_bssids and bssid not in client_bssids:
+                                used_colors.remove(color)  
+                                del bssid_color_map[bssid]  # Clear inactives BSSID colors attribued
+
+                        # Create a color palette for the matches
+                        color_palette = get_color_palette()
+                        bssids_with_ignored_client = set()
+
+                        for row in station_data:
+                            if len(row) > 5:
+                                client_mac = row[0].strip().lower()
+                                associated_bssid = row[5].strip().lower()
+                                if client_mac == sta_mac.lower() and associated_bssid:
+                                    bssids_with_ignored_client.add(associated_bssid)
+
+                        # Assign a unique color to the BSSIDs that appear in both the APs and the clients
+                        for bssid in ap_bssids & client_bssids:
+                            bssid_lc = bssid.lower()
+                            if bssid_lc in bssids_with_ignored_client:
+                                continue  # Skip coloring this BSSID
+                            if bssid not in bssid_color_map: # Assign a color if it has not been assigned
+                                try:
+                                    color = next(color_palette)
+                                except StopIteration: # Restart iteration if all colors where used
+                                    color_palette = get_color_palette()
+                                    color = next(color_palette)
+                                bssid_color_map[bssid] = color
+                                used_colors.append(color) # Set used colors
+
+                        # Show data after clearing the console
+                        clear_console()
+                        
+                        # AP's
+                        print(f"{Fore.YELLOW}[!] Listening on {interface} [Channel : {Fore.RED}{current_channel}{Fore.YELLOW}] {TXpowerinfos} on {bandz} (AP's & Clients timeout : {timeout_sec} seconds){tsharkinfos} {mappedinfos} | Press [SPACE] to pause & resume {attacktrigger} {Fore.YELLOW}{karmatrigger}")
+                        print(
+                            f"{Fore.YELLOW}[!] Captured handshakes : "
+                            f"{Fore.RED}{nb_crackable}{Fore.YELLOW} "
+                            f"(PMKID : {nb_pmkid}  4-way : {nb_4way}  Minimal (M1+M2/M2+M3) : {nb_minimal})\n"
+                        )
+                        print(f"{Fore.CYAN}==== Access Point (AP) ===={Style.RESET_ALL}")
+                        print(f"{'BSSID':<20}{'Channel':<10}{'# Beacons':<15}{'Privacy':<15}{'Cipher':<15}{'Authentication':<17}{'Power':<10}{'WPS':<20}{'ESSID':<20}{'Manufacturer'}")
+                        print('-' * 155)
+
+                        for row in ap_data:
+                            if len(row) > 1 and row[2].strip() != "Last time seen":
+                                try:
+                                    format_str = "%Y-%m-%d %H:%M:%S"  # format
+                                    date_obj = datetime.strptime(row[2].strip(), format_str)
+                                    current_time = datetime.now()
+                                    time_difference = current_time - date_obj
+                                    if time_difference.total_seconds() > timeout_sec:  # timeout 60s --> realtime live clients default
+                                        continue
+                                    else:
+                                        power_color = get_signal_color(row[8])  # Color based on the signal strength
+                                        bssid = row[0].strip()
+                                        bssid1 = row[0].strip().lower()
+                                        
+                                        channel_hope = row[3].strip()
+                                        ap_channels[bssid1] = channel_hope
+
+                                        manufacturer = get_manufacturer(bssid, manufacturer_map)                            
+                                        bssid_color = bssid_color_map.get(bssid, "")  # Get unique color if matched
+                                        
+                                        security = row[5].strip()
+                                        if security in ['OPN', 'WEP']:
+                                            security_color = Fore.GREEN
+                                        else:
+                                            security_color = bssid_color
+
+                                        MGT = row[7].strip()
+                                        if MGT == "MGT":
+                                            MGT_color = Fore.RED
+                                        else:
+                                            MGT_color = bssid_color
+
+                                        if tsharked == "no":
+                                            wps_status = "/"
+                                        else:
+                                            try:
+                                                wps_status = check_wps(bssid)
+                                                if wps_status is None or wps_status.strip() == "": # Security check (:<value can't be a None value)
+                                                    wps_status = "/"  # Default string value
+                                            except Exception as e:
+                                                wps_status = "/"
+                                            
+                                            if wps_status == "[Locked]":
+                                                wps_color = Fore.RED
+                                            else:
+                                                wps_color = bssid_color
+
+                                        h = handshake_info.get(bssid1, {})
+
+                                        if not h:
+                                            handshake_text = ""
+                                        else:
+                                            tags = []
+                                            if h.get("pmkid"):
+                                                tags.append("PMKID")
+                                            if h.get("eapol_complete"):
+                                                tags.append("4-way OK")
+
+                                            counts = h.get("eapol_counts", {})
+                                            if counts:
+                                                msg_parts = []
+                                                for m in (1, 2, 3, 4):
+                                                    c = counts.get(m, 0)
+                                                    if c:
+                                                        msg_parts.append(f"M{m}×{c}")
+                                                if msg_parts:
+                                                    tags.append(" / ".join(msg_parts))
+
+                                            handshake_text = (
+                                                f"   {Fore.CYAN}***{Fore.RED}[{' | '.join(tags)}]"
+                                                f"{Fore.CYAN}***{Style.RESET_ALL}"
+                                            )
+
+                                        print(f"{bssid_color}{bssid:<20}{row[3]:<10}{row[9]:<15}{security_color}{row[5]:<15}{bssid_color}{row[6]:<15}{MGT_color}{row[7]:<17}{power_color}{row[8]:<10}{Style.RESET_ALL}{wps_color}{format_text(wps_status, 20)}{Style.RESET_ALL}{bssid_color}{format_text(row[13], 20)}{manufacturer}{Style.RESET_ALL}{handshake_text:<25}")
+                                        
+                                except Exception as e:
+                                    errors_detected = True
+                                    log_debug(f"{e}", include_traceback=True)
+                                    continue
+
+                        # Clients 
+                        print(f"\n{Fore.CYAN}==== Clients (Stations) ===={Style.RESET_ALL}")
+                        print(f"{'Station MAC':<20}{'Manufacturer':<30}{'Power':<10}{'# Packets':<15}{'BSSID':<20}{'Probed ESSIDs'}")
+                        print('-' * 109)
+                        for row in station_data:
+                            #if len(row) > 1 and row[2].strip() != "Last time seen":
+                            if len(row) > 2 and row[2].strip() != "Last time seen":    
+                                try:
+                                    format_str = "%Y-%m-%d %H:%M:%S"  # format
+                                    date_obj = datetime.strptime(row[2].strip(), format_str)
+                                    current_time = datetime.now()
+                                    time_difference = current_time - date_obj
+                                    if time_difference.total_seconds() > timeout_sec:  # timeout 60 --> realtime live clients default
+                                        continue
+                                    else:
+                                    
+                                        station_mac = row[0].strip()
+                                        manufacturer = get_manufacturer(station_mac, manufacturer_map)
+                                        
+                                        power_color = get_signal_color(row[3])  # Color based on the signal strength
+                                        
+                                        bssid = row[5].strip()  # Client associated BSSID
+                                        bssid_color = bssid_color_map.get(bssid, "")  # Get unique color if matched
+                                        
+                                        station_mac1 = row[0].strip().lower()
+                                        bssid1 = row[5].strip().lower()
+
+                                        print(f"{bssid_color}{row[0]:<20}{format_text(manufacturer, 30)}{power_color}{row[3]:<10}{Style.RESET_ALL}{bssid_color}{row[4]:<15}{bssid:<20}{row[6]}{Style.RESET_ALL}")
+
+                                        if karma == "yes":
+                                            if len(row[6]) > 1:
+                                                Karma_list.add(row[6])
+
+                                except Exception as e:
+                                    errors_detected = True
+                                    log_debug(f"{e}", include_traceback=True)
+                                    continue
+
+                        oldchannel = current_channel
+                        now = time.monotonic()
+                            
+                        if now - last_wps_check >= 4: # 4s
+                            last_wps_check = now # reset wps timer
+                            
+                            if tsharked == "no":
+                                pass
+                            else:                     
+                                check_wps_update()
+
+                        if attackmode == "yes":
+                            print(f"\n{Fore.YELLOW}[!] Attack logs{Style.RESET_ALL}")
+                            print("\n".join(log_buffer))
+
+                        # Free memory to avoid crash
+                        ap_data.clear()
+                        station_data.clear()
+                        del ap_data, station_data
+
+                    time.sleep(0.2) # Cooldown
+                except IOError as e:
+                    log_debug(f"{file_path} in use by airodump-ng :\n{e}", include_traceback=False)
+
+            except FileNotFoundError:
+                print(f"File {file_path} doesn't exist. Closing ...")
+                log_debug(f"File {file_path} doesn't exist. Closing ...", include_traceback=False)
+                sys.exit(0)
+            except KeyboardInterrupt:
+                script_path = '/tmp/airodumpscript.sh'
+                file_path_csv = '/tmp/output-01.csv'
+                file_path_cap = '/tmp/output-01.cap'
+                print(f"\n{Fore.RED}[!] KeyboardInterrupt")
+
+                if attackmode == "yes":
+                    print(f"{Fore.YELLOW}[!] Closing attack script")
+                    process_attack.kill() # Yes brutal...
+
+                if mapped.lower() in ['y', 'yes']:
+                    try:
+                        print(f"{Fore.GREEN}[+] {Style.RESET_ALL}Launching airgraph.sh ...")
+                        airgraph()
+                    except Exception as e:
+                        print(f"{Fore.RED}[!] airgraph.sh couldn't be launched :")                
+                        print(e)
+                        log_debug(f"{e}", include_traceback=False)
+                
+                if airmon == "yes":
+                    try:    
+                        print(f"{Fore.CYAN}[INFO] {Style.RESET_ALL}Stoping monitor mode")
+                        result = subprocess.run(
+                            ["sudo","airmon-ng","stop",interface],
+                            check=True,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True  # Decode output char
+                        )
+                        print(f"{Fore.CYAN}[INFO] {Style.RESET_ALL}Restarting NetworkManager")
+                        result = subprocess.run(
+                            ["sudo","systemctl","restart","NetworkManager.service"],
+                            check=True,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True  # Decode output char
+                        )
+                    except Exception as e:
+                        print(f"{Fore.RED}[!] Couldn't restart NetworkManager :")                
+                        print(e)
+                        log_debug(f"{e}", include_traceback=False)
+
+                check_and_delete_output_file(file_path_csv, file_path_cap, script_path, save_airodump)
+
+                if TXpower == "yes":
+                    print(f"{Fore.CYAN}[INFO] {Style.RESET_ALL}Command to restore TX-Power : {Fore.YELLOW}sudo iw dev <interface> set txpower fixed 2000{Style.RESET_ALL}")
+                
+                if karma == "yes":
+                    print(f"{Fore.YELLOW}[!] Collected ESSID from karma sniffing{Style.RESET_ALL}")
+                    for mot in sorted(Karma_list):
+                        print(f"{Fore.GREEN}[*] {Style.RESET_ALL}{mot}")
+
+                if errors_detected:
+                    print(f"{Fore.RED}[ERROR] {Style.RESET_ALL}Check debug.txt")
+
+                sys.exit(0)    
+
+            finally:
+                gc.collect() # Free memory to avoid crash
+
+
+#################################################################
+######################   SAnitarize args   ######################
+#################################################################
+
+def remove_args(input_str, args_to_remove):
+    """
+    input_str: str, full argument string (e.g. "--channel 1,6,11 --scan-rounds 3")
+    args_to_remove: list of argument names to remove (e.g. ["--scan-rounds", "--dwell-time"])
+    
+    returns: cleaned argument string
+    """
+    tokens = shlex.split(input_str)
+    cleaned = []
+    skip_next = False
+
+    for i, token in enumerate(tokens):
+        if skip_next:
+            skip_next = False
+            continue
+
+        if token in args_to_remove:
+            skip_next = True  # skip this token and the next (the value)
+        else:
+            cleaned.append(token)
+
+    return " ".join(cleaned)
+
+def parse_args_to_dict(arg_str):
+    tokens = shlex.split(arg_str)
+    args_dict = {}
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if token.startswith("-"):
+            # Next value if not flag
+            if i+1 < len(tokens) and not tokens[i+1].startswith("-"):
+                args_dict[token] = tokens[i+1]
+                i += 2
+            else:
+                args_dict[token] = True
+                i += 1
+        else:
+            i += 1
+    return args_dict
 
 
 #################################################################
@@ -792,11 +1171,11 @@ def read_and_display_csv(file_path, interface, channel, mapped, file_path_cap, t
 #################################################################
 
 def main():
-    global cycle_counter
+    global errors_detected, airmon, TXpower, mapped, karma, process_attack,attackmode
     
     init_debug_file() # Launch debugger
     save_airodump = ""
-    
+
     try:
         # Temp files location
         script_path = '/tmp/airodumpscript.sh'
@@ -820,10 +1199,7 @@ def main():
                 print(f"\n{Fore.RED}[!] Couldn't download oui file : {Style.RESET_ALL}download it manually (https://standards-oui.ieee.org/oui/oui.txt) or try to disable your proxy or VPN")
                 log_debug(f"{e}", include_traceback=True)
         
-        
         check_and_install_tools(required_tools)
-
-
 
         try:
             print(f"{Fore.GREEN}[+] {Style.RESET_ALL}checking airodump-ng-oui-update ...")
@@ -839,7 +1215,6 @@ def main():
         except Exception as e:
             log_debug(f"{e}", include_traceback=True)
 
-
         # You can use airmon-ng, ifconfig, etc ...
         process = subprocess.Popen(['iwconfig'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         stdout, stderr = process.communicate()
@@ -848,28 +1223,52 @@ def main():
 
         # User inputs
         interface = input(f"\n{Fore.GREEN}[+] {Style.RESET_ALL}Select the interface : ").strip()
-        channel = input(f"{Fore.GREEN}[+] {Style.RESET_ALL}Add commands from airodump-ng (--help to display aviable commands aviable with this tool) : ").strip()
+        channel = input(f"{Fore.GREEN}[+] {Style.RESET_ALL}Add commands from airodump-ng (--help to display help menu, --get to save cap files, --attack for automated attack mode) : ").strip()
         
         if channel == "--help":
             help_airodump()
             log_debug("[INFO] --help command display", include_traceback=False)
             sys.exit(0)        
 
-        airmoncheck = input(f"{Fore.GREEN}[+] {Style.RESET_ALL}Check kill (airmon-ng) ? NetworkManager will restart at the end (y/n) : ").strip()
+        airmoncheck = input(f"{Fore.GREEN}[+] {Style.RESET_ALL}Check kill & start airmon-ng ? Will restart NetworkManager and stop monitor mode at the end : ").strip()
+        setTXpower = input(f"{Fore.GREEN}[+] {Style.RESET_ALL}Up TX Power to 30 DB ? TX power will stay set to 30 DB at the end (y/n) : ").strip()
         mapping = input(f"{Fore.GREEN}[+] {Style.RESET_ALL}Setup wireless mapping at the end of the scan (airdecap-ng & airgraph-ng) (y/n) : ").strip()
-        
+        timeout_str = input(f"{Fore.GREEN}[+] {Style.RESET_ALL}Timeout after which APs & Clients are considered dead (default 60 seconds) : ")
+
+        try:
+            timeout_sec = float(timeout_str)
+        except ValueError:
+            print(f"{Fore.YELLOW}[!] {Style.RESET_ALL}Default value set for AP's & Clients timeout : '60'")
+            log_debug("[INFO] Default value set for AP's & Clients timeout : '60'", include_traceback=False)
+            timeout_sec = 60
+
         if mapping.lower() in ['y', 'yes']:
             mapped = "yes"
         elif mapping.lower() in ['n', 'no']:
             mapped = "no"
         else:
-            print(f"{Fore.YELLOW}[!] {Style.RESET_ALL}Default value set : 'no'")
+            print(f"{Fore.YELLOW}[!] {Style.RESET_ALL}Default value set for wireless mapping : 'no'")
             log_debug("[INFO] mapped error input. Default setting set to 'no'", include_traceback=False)
             mapped = "no"
         
-        
-        check_and_delete_output_file(file_path_csv, file_path_cap, script_path, save_airodump)
+        if setTXpower.lower() in ['y', 'yes']:
+            TXpower = "yes"
+        elif setTXpower.lower() in ['n', 'no']:
+            TXpower = "no"
+        else:
+            print(f"{Fore.YELLOW}[!] {Style.RESET_ALL}Default value set for TXpower : 'no'")
+            log_debug("[INFO] TXpower error input. Default setting set to 'no'", include_traceback=False)
+            TXpower = "no"
 
+        if TXpower == "yes":
+            # Try to set at 30db
+            if set_txpower(interface, 30):
+                txp = get_txpower(interface)
+                print(f"{Fore.GREEN}[+] {Style.RESET_ALL}TX-Power set to {txp:.2f} dBm")
+            else:
+                TXpower = "no"
+
+        check_and_delete_output_file(file_path_csv, file_path_cap, script_path, save_airodump)
 
         if "--get" in channel:
             save_airodump = "yes"
@@ -879,16 +1278,85 @@ def main():
 
         if airmoncheck.lower() in ['y', 'yes']:
             airmon = "yes"
+            try:
+                out = subprocess.check_output(
+                    ["sudo", "airmon-ng", "start", interface],
+                    text=True, stderr=subprocess.STDOUT
+                )
+            except subprocess.CalledProcessError as e:
+                print(f"{Fore.RED}[!] Auto use of airmon on interface failed :\n{e.output.strip()}")
+                print(f"{Fore.YELLOW}[!] {Style.RESET_ALL}Try the manual way !")
+                exit(1)
+
+            # ---------- 1)  Try to read monitor mode in the output ----------
+            regexes = [
+                r'on\s+\[[^\]]+\](\w+mon)\b',          # mac80211 format
+                r'monitor mode enabled on (\w+mon)\b', # old format
+                r'\(monitor mode enabled\)',
+            ]
+
+            for rgx in regexes:
+                m = re.search(rgx, out)
+                if m:
+                    if m.groups():
+                        interface = m.group(1)
+                    break
+
+            # ---------- 2)  Fallback : maybe already on mon mode ----------
+            if not m:
+                try:
+                    info = subprocess.check_output(["iw", "dev", interface, "info"], text=True)
+                    if re.search(r'\btype\s+monitor\b', info):
+                        pass
+                    else:
+                        raise ValueError("not monitor yet")
+                except Exception:
+                    # ---------- 3)  Scanner toutes les interfaces *mon -------------
+                    try:
+                        info = subprocess.check_output(["iw", "dev", interface, "info"], text=True)
+                        mode = re.search(r'\btype\s+(\w+)', info)
+                        if mode and mode.group(1) != "monitor":
+                            raise ValueError(f"[!] {Fore.RED}{interface} is {mode.group(1)}, not monitor")            
+                    
+                    except Exception as e:
+                        print(f"{Fore.RED}[!] Auto use of airmon on interface failed : \n{e}")
+                        print(f"{Fore.CYAN}[!] {Style.RESET_ALL}Try the manual way !")
+                        exit(1)
+
         elif airmoncheck.lower() in ['n', 'no']:
             airmon = "no"
         else:
-            print(f"{Fore.YELLOW}[!] {Style.RESET_ALL}Default value set : 'no'")
+            print(f"{Fore.YELLOW}[!] {Style.RESET_ALL}Default value set for Check kill airmon-ng : 'no'")
             log_debug("[INFO] airmon error input. Default setting set to 'no'", include_traceback=False)
             airmon = "no"
 
+        if "--attack" in channel:
+            channel = channel.replace("--attack", "").strip()  # Remove --attack variable for airodump-ng command
+            attackmode = "yes"
+            if "-f" not in channel:
+                print(f"{Fore.YELLOW}[!] {Style.RESET_ALL}-f option added with value set to : '60000' (ms)")
+                log_debug("[INFO] -f option added with value set to : '60000' (ms)", include_traceback=False)
+        else:
+            attackmode = "no"
 
-        airodump(script_path, channel, interface, save_airodump, airmon)
+        if "--karma" in channel:
+            channel = channel.replace("--karma", "").strip()  # Remove --karma variable for airodump-ng command
+            karma = "yes"
 
+        attack_rounds = ""
+        attack_time = ""
+
+        args_dict = parse_args_to_dict(channel)
+
+        if "--scan-rounds" in args_dict:
+            attack_rounds = ["--scan-rounds", args_dict["--scan-rounds"]]
+            channel = remove_args(channel, ["--scan-rounds"])
+
+        if "--dwell-time" in args_dict:
+            attack_time = ["--dwell-time", args_dict["--dwell-time"]]
+            channel = remove_args(channel, ["--dwell-time"])
+
+        airodump(script_path, channel, interface, save_airodump, airmon, attackmode)
 
         try:
             # Checking aviability
@@ -900,50 +1368,53 @@ def main():
         except subprocess.CalledProcessError:
             tsharked = "no"
         
-        time.sleep(3)
+        time.sleep(0.5)
         check_wps_update()
-        
-        while True:
-            cycle_counter += 1
-            time.sleep(5)  # Refresh every 2s
-            try:
-                read_and_display_csv(file_path_csv, interface, channel, mapped, file_path_cap, tsharked, save_airodump)
-                
-            except KeyboardInterrupt:
-                print(f"\n{Fore.RED}[!] KeyboardInterrupt")
-                try:
-                    if mapped.lower() in ['y', 'yes']:
-                        print(f"{Fore.GREEN}[+] {Style.RESET_ALL}Launching airgraph.sh ...")
-                        airgraph()
-                except Exception as e:
-                    print(f"{Fore.RED}[!] airgraph.sh couldn't be launched :")                
-                    print(e)
-                    log_debug(f"{e}", include_traceback=False)
 
-                try:
-                    if airmon == "yes":
-                        print(f"{Fore.CYAN}[INFO] {Style.RESET_ALL}Restarting NetworkManager")
-                        result = subprocess.run(
-                            ["sudo", "NetworkManager", "restart"],
-                            check=True,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                            text=True  # Decode output char
-                        )
-                except Exception as e:
-                    print(f"{Fore.RED}[!] Couldn't restart NetworkManager :")                
-                    print(e)
-                    log_debug(f"{e}", include_traceback=False)
-            
-                check_and_delete_output_file(file_path_csv, file_path_cap, script_path, save_airodump)
-                sys.exit(0)         
-            
-            finally:
-                gc.collect() # Free memory to avoid crash
+        if "--karma" in channel:
+            karma = "yes"
 
+        if attackmode == "yes":
+            time.sleep(3)
+            
+            cmd = ["python", "attacker.py", "-i", interface]
+
+            if "--channel" in args_dict:
+                cmd += ["--channel", args_dict["--channel"]]
+            elif "-c" in args_dict:
+                cmd += ["--channel", args_dict["-c"]]
+
+            if "--band" in args_dict:
+                cmd += ["--band", args_dict["--band"]]
+            elif "-b" in args_dict:
+                cmd += ["--band", args_dict["-b"]]
+
+            if "--cswitch" in args_dict:
+                cmd += ["--cswitch", args_dict["--cswitch"]]
+
+            if attack_rounds:
+                cmd += attack_rounds
+
+            if attack_time:
+                cmd += attack_time
+
+            process_attack = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                bufsize=1
+            )
+            threading.Thread(target=stream_output, args=(process_attack,), daemon=True).start()
+            print(f"{Fore.YELLOW}[!] Attack mode lanched :", " ".join(cmd))
+
+        read_and_display_csv(file_path_csv, interface, channel, mapped, TXpower, file_path_cap, tsharked, save_airodump, timeout_sec)
 
     except KeyboardInterrupt:
         print(f"\n{Fore.RED}[!] KeyboardInterrupt")
+
+        if attackmode == "yes":
+            print(f"\n{Fore.YELLOW}[!] Closing attack script")
+            process_attack.kill() # Yes brutal...
         try:
             if mapped.lower() in ['y', 'yes']:
                 print(f"{Fore.GREEN}[+] {Style.RESET_ALL}Launching airgraph.sh ...")
@@ -954,22 +1425,42 @@ def main():
             print(e)
             log_debug(f"{e}", include_traceback=False)
 
-        try:
             if airmon == "yes":
-                print(f"{Fore.CYAN}[INFO] {Style.RESET_ALL}Restarting NetworkManager")
-                result = subprocess.run(
-                    ["sudo", "NetworkManager", "restart"],
-                    check=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True  # Decode output char
-                )
-        except Exception as e:
-            print(f"{Fore.RED}[!] Couldn't restart NetworkManager :")                
-            print(e)
-            log_debug(f"{e}", include_traceback=False)
+                try:    
+                    print(f"{Fore.CYAN}[INFO] {Style.RESET_ALL}Stoping monitor mode")
+                    result = subprocess.run(
+                        ["sudo","airmon-ng","stop",interface],
+                        check=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True  # Decode output char
+                    )
+                    print(f"{Fore.CYAN}[INFO] {Style.RESET_ALL}Restarting NetworkManager")
+                    result = subprocess.run(
+                        ["sudo","systemctl","restart","NetworkManager.service"],
+                        check=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True  # Decode output char
+                    )
+                except Exception as e:
+                    print(f"{Fore.RED}[!] Couldn't restart NetworkManager :")                
+                    print(e)
+                    log_debug(f"{e}", include_traceback=False)
 
         check_and_delete_output_file(file_path_csv, file_path_cap, script_path, save_airodump)
+
+        if TXpower == "yes":
+            print(f"{Fore.CYAN}[INFO] {Style.RESET_ALL}Command to restore TX-Power : {Fore.YELLOW}sudo iw dev <interface> set txpower fixed 2000{Style.RESET_ALL}")
+
+        if karma == "yes":
+            print(f"{Fore.YELLOW}[!] Collected ESSID from karma sniffing{Style.RESET_ALL}")
+            for mot in sorted(Karma_list):
+                print(f"{Fore.GREEN}[*] {Style.RESET_ALL}{mot}")
+
+        if errors_detected:
+            print(f"{Fore.RED}[ERROR] {Style.RESET_ALL}Check debug.txt")
+
         sys.exit(0)        
         
 if __name__ == "__main__":
