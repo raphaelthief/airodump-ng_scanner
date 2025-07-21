@@ -1413,7 +1413,7 @@ def main():
         print(f"\n{Fore.RED}[!] KeyboardInterrupt")
 
         if attackmode == "yes":
-            print(f"\n{Fore.YELLOW}[!] Closing attack script")
+            print(f"{Fore.YELLOW}[!] Closing attack script")
             process_attack.kill() # Yes brutal...
         try:
             if mapped.lower() in ['y', 'yes']:
