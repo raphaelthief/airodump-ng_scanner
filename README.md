@@ -1,6 +1,14 @@
 # Enhanced Airodump-ng Scrolling and Visualization Tool
 This Python script builds upon the functionality of Airodump-ng, introducing advanced features that enhance usability and provide more insights during wireless network scanning and analysis.
 
+## UPDATES [21 JULY 2025]
+- Ability to pause the script and resume display by pressing the [space] key while airodump continues capturing in the background.
+- Display of captured EAPOL frames (M1/M2/M3/M4) as well as PMKID packets.
+- Real-time tracking of captured handshakes and crackable PMKIDs.
+- Attack script available with the --attack option. Launches client deauth, broadcast deauth, and various PMKID attacks (see --help for more details). Only reason code 7 is currently used for deauthentication for now.
+- Attacks crafted using Scapy and tested for optimal performance based on analysis of packets sent by various tools such as aireplay-ng and hcxdumptool.
+- Collection of client ESSID probes for karma-style attacks.
+
 ## Features
 1. Scrolling and Real-time Updates
 Enables smooth scrolling through the Airodump-ng results, overcoming the static display limitations of the original tool.
