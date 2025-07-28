@@ -167,17 +167,32 @@ def check_and_delete_output_file(file_path_csv, file_path_cap, script_path, save
         print(f"{Fore.RED}[!] Couldn't delete '/tmp/output-01.log.csv' (--get option feature trigger) : {e}")
         log_debug(f"Couldn't delete '/tmp/output-01.log.csv' (--get option feature trigger)", include_traceback=False)
 
+    try:
+        if os.path.exists("/tmp/output-01.hc22000"):
+            os.remove("/tmp/output-01.hc22000")
+            print(f"{Fore.CYAN}[INFO] {Style.RESET_ALL}The file '/tmp/output-01.hc22000' has been deleted")
+            log_debug(f"[INFO] The file '/tmp/output-01.hc22000' has been deleted", include_traceback=False)
+    except PermissionError as e:
+        print(f"{Fore.RED}[!] Couldn't delete '/tmp/output-01.hc22000' : {e}")
+        log_debug(f"Couldn't delete '/tmp/output-01.hc22000'", include_traceback=False)
+
+
 def check_and_install_tools(tools):
     """
-    Vérifie si les outils nécessaires sont installés, et les installe s'ils ne le sont pas.
+    Check & install tools for dependencies
     
-    :param tools: Liste des noms des outils à vérifier.
+    :param tools: all the tools to check.
     """
+    hcx_present = False
     for tool in tools:
+        if tool == "hcxpcapngtool":
+            hcx_present = True
         try:
             # Checking aviability
             subprocess.run(["which", tool], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
         except subprocess.CalledProcessError:
+            if hcx_present:
+                tool = "hcxtools"
             print(f"{Fore.RED}[!] {Style.RESET_ALL}{tool} isn't installed")
             install = input(f"{Fore.CYAN}[?] {Style.RESET_ALL}Install {tool} ? (y/n) : ").strip().lower()
             if install in ['y', 'yes']:
@@ -323,7 +338,7 @@ def help_airodump():
                     - If no channel (-c or --channel) is provided, the attack will run on channels 1, 6, 11 by default
       --karma  : Collect all probe ESSID from clients and show them all when closing    
   {Fore.GREEN}------------------------------------------------------------------------{Style.RESET_ALL}
-  
+
   Internal functionnement:
       airodump-ng <selected interface> --write /tmp/output --output-format csv,cap --write-interval 2 --background 1 <your commands inputs>
       manufacturer comes from oui file
@@ -653,6 +668,93 @@ def save_to_csv(file_name, headers, data):
 ######################### Display infos #########################
 #################################################################
 
+def hex_to_str(hex_str):
+    try:
+        return bytes.fromhex(hex_str).decode('utf-8', errors='replace')
+    except Exception as e:
+        log_debug(f"[ERROR] Could'nt convert ESSID hex : {e}", include_traceback=False)
+        return f"[HEX convert error]"
+
+
+def extract_bssid_essid_map():
+    """Utilise tshark pour extraire les couples BSSID/ESSID"""
+    bssid_essid = {}
+    try:
+        output = subprocess.check_output([
+            "tshark",
+            "-r", "/tmp/output-01.cap",
+            "-Y", "wlan.fc.type_subtype == 8 || wlan.fc.type_subtype == 5",  # Beacon (8) & Probe Response (5)
+            "-T", "fields",
+            "-e", "wlan.bssid",
+            "-e", "wlan.ssid"
+        ], text=True)
+
+        for line in output.strip().split("\n"):
+            fields = line.strip().split("\t")
+            if len(fields) == 2:
+                bssid_raw, essid = fields
+                bssid = bssid_raw.replace(":", "").lower()
+                if bssid and essid:
+                    bssid_essid[bssid] = essid
+    except subprocess.CalledProcessError as e:
+        log_debug(f"[ERROR] Tshark fail : {e}", include_traceback=False)
+        print(f"{Fore.RED}[!] Tshark fail exec. Check debug file")
+
+    return bssid_essid
+
+
+def run_hcxpcapngtool():
+    hc22000_temp = "/tmp/output-01.hc22000"
+    output_file = "ready_to_crack.hc22000"
+
+    cmd = [
+        "hcxpcapngtool",
+        "-o", hc22000_temp,
+        "/tmp/output-01.cap"
+    ]
+
+    print(f"{Fore.YELLOW}[*] Launching : {Style.RESET_ALL}{' '.join(cmd)}")
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    existing_lines = set()
+    if os.path.exists(output_file):
+        with open(output_file, 'r', encoding='utf-8') as f:
+            existing_lines = set(line.strip() for line in f if line.strip())
+
+    # map BSSID -> ESSID 
+    essid_map = extract_bssid_essid_map()
+    
+    print(f"{Fore.YELLOW}[!] Looking for PMKID & Handshakes")
+    new_lines = []
+
+    with open(hc22000_temp, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith("WPA*"):
+                parts = line.split('*')
+                if len(parts) >= 4:
+                    bssid = parts[3].lower()
+                    essid = essid_map.get(bssid, "ESSID Unknown")
+                    if essid != "ESSID Unknown":
+                        essid = hex_to_str(essid)
+                    print(f"{Fore.GREEN}[+] {essid} ({bssid})\n{Style.RESET_ALL}hashcat -m 22000 -a 0 \"{Fore.YELLOW}{line}{Style.RESET_ALL}\" wordlist.txt")
+                new_lines.append(line)
+
+    updated = False
+    if new_lines:
+        with open(output_file, 'a', encoding='utf-8') as f:
+            for line in new_lines:
+                if line not in existing_lines:
+                    updated = True
+                    f.write(line + '\n')
+
+    if updated:
+        print(f"{Fore.GREEN}[+] {Fore.YELLOW}ready_to_crack.hc22000 updated")
+
+    if new_lines:
+        print(f"{Fore.CYAN}[?] {Style.RESET_ALL}ready_to_crack.hc22000 usage :\nhashcat -m 22000 -a 0 ready_to_crack.hc22000 wordlist.txt")
+
+
 def stream_output(process):
     for line in iter(process.stdout.readline, b''):
         decoded = line.decode(errors="replace").rstrip()
@@ -665,7 +767,7 @@ def analyse_handshakes(cap_file: str) -> dict[str, dict]:
       {
         "pmkid"         : True/False,
         "eapol_counts"  : {1: n1, 2: n2, 3: n3, 4: n4},
-        "eapol_total"   : somme des n,
+        "eapol_total"   : Total n,
         "eapol_complete": True/False (at least 1x M1,M2,M3,M4),
         "crackable"     : pmkid or eapol_complete
       }
@@ -1101,6 +1203,8 @@ def read_and_display_csv(file_path, interface, channel, mapped, TXpower, file_pa
                         print(e)
                         log_debug(f"{e}", include_traceback=False)
 
+                run_hcxpcapngtool()
+
                 check_and_delete_output_file(file_path_csv, file_path_cap, script_path, save_airodump)
 
                 if TXpower == "yes":
@@ -1182,7 +1286,7 @@ def main():
         file_path_csv = '/tmp/output-01.csv'
         file_path_cap = '/tmp/output-01.cap'
         oui_file = "oui.txt"
-        required_tools = ["aircrack-ng", "airgraph-ng", "tshark"]
+        required_tools = ["aircrack-ng", "airgraph-ng", "tshark", "hcxpcapngtool"]
         
         # Check oui file for manufacturer infos
         if not os.path.exists(oui_file):
@@ -1447,6 +1551,8 @@ def main():
                     print(f"{Fore.RED}[!] Couldn't restart NetworkManager :")                
                     print(e)
                     log_debug(f"{e}", include_traceback=False)
+
+        #run_hcxpcapngtool()
 
         check_and_delete_output_file(file_path_csv, file_path_cap, script_path, save_airodump)
 
