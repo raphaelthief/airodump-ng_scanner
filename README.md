@@ -2,6 +2,11 @@
 This Python script builds upon the functionality of Airodump-ng, introducing advanced features that enhance usability and provide more insights during wireless network scanning and analysis.
 
 ## UPDATES
+### [28 JULY 2025]
+- Displays the hashcat command to use, with the hash directly generated individually for each captured PMKID or 4-way handshake, along with the associated ESSID translated from the frames (Hex to String).
+- Displays the hashcat command to start the password cracking process using an automatically created .hc22000 file.
+- Tracks and updates hashes in the .hc22000 file after each execution. Each hash is unique, and duplicates are ignored.
+
 ### [21 JULY 2025]
 - Ability to pause the script and resume display by pressing the [space] key while airodump continues capturing in the background.
 - Display of captured EAPOL frames (M1/M2/M3/M4) as well as PMKID packets.
@@ -9,11 +14,6 @@ This Python script builds upon the functionality of Airodump-ng, introducing adv
 - Attack script available with the --attack option. Launches client deauth, broadcast deauth, and various PMKID attacks (see --help for more details). Only reason code 7 is currently used for deauthentication for now.
 - Attacks crafted using Scapy and tested for optimal performance based on analysis of packets sent by various tools such as aireplay-ng and hcxdumptool.
 - Collection of client ESSID probes for karma-style attacks.
-
-### [28 JULY 2025]
-- Displays the hashcat command to use, with the hash directly generated individually for each captured PMKID or 4-way handshake, along with the associated ESSID translated from the frames (Hex to String).
-- Displays the hashcat command to start the password cracking process using an automatically created .hc22000 file.
-- Tracks and updates hashes in the .hc22000 file after each execution. Each hash is unique, and duplicates are ignored.
 
 ## Features
 1. Scrolling and Real-time Updates
