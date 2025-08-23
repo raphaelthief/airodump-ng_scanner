@@ -39,6 +39,7 @@ errors_detected = False
 
 oldchannel = ""
 
+crackme = False
 
 #################################################################
 #######################   Errors & debug  #######################
@@ -882,7 +883,7 @@ def get_current_channel(interface):
 
 def read_and_display_csv(file_path, interface, channel, mapped, TXpower, file_path_cap, tsharked, save_airodump, timeout_sec):
     """Display CSV data from airodump-ng with unique colors for each matched BSSID."""
-    global last_wps_check, errors_detected, oldchannel, karma, process_attack,attackmode
+    global last_wps_check, errors_detected, oldchannel, karma, process_attack, attackmode, crackme
     
     # Pause & Resume stuff 
     fd = sys.stdin.fileno()
@@ -901,6 +902,7 @@ def read_and_display_csv(file_path, interface, channel, mapped, TXpower, file_pa
 
         # Get current channel listening
         current_channel = get_current_channel(interface)
+        
 
         if not paused:
             #time.sleep(3)  # Refresh every 3s
@@ -916,6 +918,9 @@ def read_and_display_csv(file_path, interface, channel, mapped, TXpower, file_pa
                 nb_pmkid       = sum(1 for v in handshake_info.values() if v["pmkid"])
                 nb_4way        = sum(1 for v in handshake_info.values() if v["eapol_complete"])
                 nb_minimal     = sum(1 for v in handshake_info.values() if v.get("eapol_minimal", False))
+
+                if any([nb_crackable, nb_pmkid, nb_4way, nb_minimal]):
+                    crackme = True
 
                 try:
                     manufacturer_map = load_manufacturer_data("oui.txt") # Manufacturer datas from https://standards-oui.ieee.org/oui/oui.txt
@@ -1203,7 +1208,8 @@ def read_and_display_csv(file_path, interface, channel, mapped, TXpower, file_pa
                         print(e)
                         log_debug(f"{e}", include_traceback=False)
 
-                run_hcxpcapngtool()
+                if crackme == True:
+                    run_hcxpcapngtool()
 
                 check_and_delete_output_file(file_path_csv, file_path_cap, script_path, save_airodump)
 
